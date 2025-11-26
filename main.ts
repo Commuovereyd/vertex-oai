@@ -1,0 +1,1330 @@
+import { Buffer } from "node:buffer";
+
+// --- 全局常量更新为 Vertex AI Express Mode 的地址 ---
+const TARGET_BASE_URL = "https://aiplatform.googleapis.com";
+const TARGET_PREFIX = "/v1/publishers/google/models";
+
+export default {
+  async fetch(request) {
+    if (request.method === "OPTIONS") {
+      return handleOPTIONS();
+    }
+    // 确保 API Key 在请求头 (Authorization) 中获取
+    const auth = request.headers.get("Authorization");
+    const apiKey = auth?.split(" ")[1];
+
+    const errHandler = (err) => {
+      console.error(err);
+      return new Response(err.message, fixCors({ status: err.status ?? 500 }));
+    };
+    try {
+      if (!apiKey) {
+        throw new HttpError("Missing API Key (Authorization header)", 401);
+      }
+
+      const assert = (success) => {
+        if (!success) {
+          throw new HttpError("The specified HTTP method is not allowed for the requested resource", 400);
+        }
+      };
+      const { pathname } = new URL(request.url);
+      switch (true) {
+        case pathname.endsWith("/chat/completions"):
+          assert(request.method === "POST");
+          return handleCompletions(await request.json(), apiKey)
+            .catch(errHandler);
+        case pathname.endsWith("/audio/speech"):
+          assert(request.method === "POST");
+          return handleSpeech(await request.json(), apiKey)
+            .catch(errHandler);
+        case pathname.endsWith("/embeddings"):
+          assert(request.method === "POST");
+          return handleEmbeddings(await request.json(), apiKey)
+            .catch(errHandler);
+        case pathname.endsWith("/models"):
+          assert(request.method === "GET");
+          return handleModels(apiKey)
+            .catch(errHandler);
+        default:
+          throw new HttpError("404 Not Found", 404);
+      }
+    } catch (err) {
+      return errHandler(err);
+    }
+  }
+};
+
+class HttpError extends Error {
+  constructor(message, status) {
+    super(message);
+    this.name = this.constructor.name;
+    this.status = status;
+  }
+}
+
+const fixCors = ({ headers, status, statusText }) => {
+  headers = new Headers(headers);
+  headers.set("Access-Control-Allow-Origin", "*");
+  if (!headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+  return { headers, status, statusText };
+};
+
+
+const handleOPTIONS = async () => {
+  return new Response(null, {
+    headers: {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "*",
+      "Access-Control-Allow-Headers": "*",
+    }
+  });
+};
+
+const API_CLIENT = "genai-js/0.21.0";
+// 移除 apiKey 参数，因为我们通过 URL query param 传递它
+const makeHeaders = (more) => ({
+  "x-goog-api-client": API_CLIENT,
+  ...more
+});
+
+async function handleModels(apiKey) {
+  // 注意：Vertex AI Express Mode 不一定支持此模型列表 API。
+  const url = `${TARGET_BASE_URL}${TARGET_PREFIX}`;
+  const response = await fetch(url, {
+    // Vertex AI model listing might require the key in the URL if not using auth headers
+    headers: makeHeaders(),
+  });
+  let { body } = response;
+  if (response.ok) {
+    // 假设 Vertex AI 的响应结构与 Gemini API 类似
+    const { models } = JSON.parse(await response.text());
+    body = JSON.stringify({
+      object: "list",
+      data: (models || []).map(({ name }) => ({
+        id: name.replace("models/", ""),
+        object: "model",
+        created: 0,
+        owned_by: "",
+      })),
+    }, null, "  ");
+  }
+  return new Response(body, fixCors(response));
+}
+
+const DEFAULT_EMBEDDINGS_MODEL = "gemini-embedding-001";
+async function handleEmbeddings(req, apiKey) {
+  let modelFull, model;
+  switch (true) {
+    case typeof req.model !== "string":
+      throw new HttpError("model is not specified", 400);
+    case req.model.startsWith("models/"):
+      modelFull = req.model;
+      model = modelFull.substring(7);
+      break;
+    case req.model.startsWith("gemini-"):
+      model = req.model;
+      break;
+    default:
+      model = DEFAULT_EMBEDDINGS_MODEL;
+  }
+  modelFull = modelFull ?? "models/" + model;
+
+  if (!Array.isArray(req.input)) {
+    req.input = [req.input];
+  }
+
+  // 构造 Vertex AI URL
+  const url = `${TARGET_BASE_URL}${TARGET_PREFIX}/${model}:batchEmbedContents`;
+  const newURL = new URL(url);
+  newURL.searchParams.set("key", apiKey);
+
+  const response = await fetch(newURL.toString(), {
+    method: "POST",
+    headers: makeHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({
+      "requests": req.input.map(text => ({
+        model: modelFull,
+        content: { parts: [{ text }] }, // Fix: text part needs to be in an array
+        outputDimensionality: req.dimensions,
+      }))
+    })
+  });
+  let { body } = response;
+  if (response.ok) {
+    const { embeddings } = JSON.parse(await response.text());
+    body = JSON.stringify({
+      object: "list",
+      data: embeddings.map(({ values }, index) => ({
+        object: "embedding",
+        index,
+        embedding: values,
+      })),
+      model,
+    }, null, "  ");
+  }
+  return new Response(body, fixCors(response));
+}
+
+function addWavHeader(pcmData) {
+  const sampleRate = 24000;
+  const numChannels = 1;
+  const bitsPerSample = 16;
+  const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+  const blockAlign = numChannels * (bitsPerSample / 8);
+  const dataSize = pcmData.length;
+  const chunkSize = 36 + dataSize;
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0);
+  header.writeUInt32LE(chunkSize, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(numChannels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(dataSize, 40);
+  return Buffer.concat([header, pcmData]);
+}
+
+// TTS API 路径也需要更新，但逻辑保持不变
+async function handleTts(req, apiKey) {
+  if (!req.messages || req.messages.length === 0) {
+    throw new HttpError("`messages` array is required for TTS.", 400);
+  }
+  if (!req.audio?.voice) {
+    throw new HttpError("`audio.voice` is required for TTS.", 400);
+  }
+  const lastMessage = req.messages[req.messages.length - 1];
+  const parts = await transformMsg(lastMessage);
+  const inputText = parts.map(p => p.text).join(' ');
+  if (!inputText) {
+    throw new HttpError("A non-empty text message is required for TTS.", 400);
+  }
+
+  const geminiTtsModel = req.model || "gemini-2.5-flash-preview-tts";
+
+  const geminiPayload = {
+    model: geminiTtsModel,
+    contents: [{
+      parts: [{ text: inputText }]
+    }],
+    generationConfig: {
+      responseModalities: ["AUDIO"],
+      speechConfig: {
+        voiceConfig: {
+          prebuiltVoiceConfig: {
+            voiceName: req.audio.voice
+          }
+        }
+      }
+    },
+  };
+
+  // 构造 Vertex AI URL
+  const url = `${TARGET_BASE_URL}${TARGET_PREFIX}/${geminiTtsModel}:generateContent`;
+  const newURL = new URL(url);
+  newURL.searchParams.set("key", apiKey);
+
+  const response = await fetch(newURL.toString(), {
+    method: "POST",
+    headers: makeHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(geminiPayload),
+  });
+
+  // ... (rest of TTS response processing remains the same) ...
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.error("Gemini TTS API Error:", errorBody);
+    return new Response(errorBody, fixCors(response));
+  }
+  const geminiResponse = await response.json();
+  const audioDataBase64 = geminiResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+  if (!audioDataBase64) {
+    console.error("Could not extract audio data from Gemini response:", JSON.stringify(geminiResponse));
+    throw new HttpError("Failed to generate audio, invalid response from upstream.", 500);
+  }
+  const requestedFormat = req.audio.format || 'wav';
+  let finalAudioDataB64 = audioDataBase64;
+  let finalFormat = 'pcm_s16le_24000_mono';
+  if (requestedFormat.toLowerCase() === 'wav') {
+    const pcmData = Buffer.from(audioDataBase64, 'base64');
+    const wavData = addWavHeader(pcmData);
+    finalAudioDataB64 = wavData.toString('base64');
+    finalFormat = 'wav';
+  }
+  const openAiResponse = {
+    id: "chatcmpl-tts-" + generateId(),
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: req.model,
+    choices: [{
+      index: 0,
+      message: {
+        role: "assistant",
+        audio: {
+          format: finalFormat,
+          data: finalAudioDataB64,
+          transcript: inputText,
+        }
+      },
+      finish_reason: "stop",
+    }],
+    usage: null,
+  };
+  return new Response(JSON.stringify(openAiResponse, null, 2), fixCors({ headers: response.headers }));
+}
+
+async function handleSpeech(req, apiKey) {
+  if (!req.input) {
+    throw new HttpError("`input` field is required.", 400);
+  }
+  if (!req.voice) {
+    throw new HttpError("`voice` field is required.", 400);
+  }
+  const geminiTtsModel = req.model || "gemini-2.5-flash-preview-tts";
+  const geminiPayload = {
+    model: geminiTtsModel,
+    contents: [{
+      parts: [{ text: req.input }]
+    }],
+    generationConfig: {
+      responseModalities: ["AUDIO"],
+      speechConfig: {
+        voiceConfig: {
+          prebuiltVoiceConfig: {
+            voiceName: req.voice
+          }
+        }
+      }
+    },
+  };
+
+  // 构造 Vertex AI URL
+  const url = `${TARGET_BASE_URL}${TARGET_PREFIX}/${geminiTtsModel}:generateContent`;
+  const newURL = new URL(url);
+  newURL.searchParams.set("key", apiKey);
+
+  const geminiApiResponse = await fetch(newURL.toString(), {
+    method: "POST",
+    headers: makeHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(geminiPayload),
+  });
+
+  // ... (rest of Speech response processing remains the same) ...
+  if (!geminiApiResponse.ok) {
+    const errorBody = await geminiApiResponse.text();
+    console.error("Gemini TTS API Error:", errorBody);
+    return new Response(errorBody, fixCors({ headers: geminiApiResponse.headers, status: geminiApiResponse.status, statusText: geminiApiResponse.statusText }));
+  }
+  const geminiResponseJson = await geminiApiResponse.json();
+  const audioDataBase64 = geminiResponseJson.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+  if (!audioDataBase64) {
+    throw new HttpError("Failed to extract audio data from Gemini response.", 500);
+  }
+  const pcmData = Buffer.from(audioDataBase64, 'base64');
+  const responseFormat = req.response_format || 'wav';
+  let audioData;
+  let contentType;
+  const corsHeaders = fixCors({}).headers;
+  switch (responseFormat.toLowerCase()) {
+    case 'wav':
+      audioData = addWavHeader(pcmData);
+      contentType = 'audio/wav';
+      break;
+    case 'pcm':
+      audioData = pcmData;
+      contentType = 'audio/L16; rate=24000; channels=1';
+      break;
+    case 'mp3':
+    case 'opus':
+    case 'aac':
+    case 'flac':
+    default:
+      audioData = addWavHeader(pcmData);
+      contentType = 'audio/wav';
+      corsHeaders.set('X-Warning', `Unsupported format "${responseFormat}" requested, fallback to "wav".`);
+      break;
+  }
+  corsHeaders.set('Content-Type', contentType);
+  return new Response(audioData, {
+    status: 200,
+    headers: corsHeaders
+  });
+}
+
+
+const DEFAULT_MODEL = "gemini-2.5-flash";
+async function handleCompletions(req, apiKey) {
+  const isTtsRequest = Array.isArray(req.modalities) && req.modalities.includes("audio");
+  if (isTtsRequest) {
+    return handleTts(req, apiKey);
+  }
+  let model;
+  switch (true) {
+    case typeof req.model !== "string":
+      break;
+    case req.model.startsWith("models/"):
+      model = req.model.substring(7);
+      break;
+    case req.model.startsWith("gemini-"):
+    case req.model.startsWith("gemma-"):
+    case req.model.startsWith("learnlm-"):
+      model = req.model;
+  }
+  model = model || DEFAULT_MODEL;
+
+  // --- 核心重定向逻辑 ---
+  let targetModel = model;
+  if (model.includes("gemini-2.5-pro-actually-3")) {
+    console.log(`[Proxy] Redirecting model: ${model} -> gemini-3-pro-preview`);
+    targetModel = "gemini-3-pro-preview";
+  }
+  // --- 结束核心重定向逻辑 ---
+
+  const isImageGenerationRequest = targetModel.includes("-image");
+
+  let body = await transformRequest(req, targetModel); // 使用 targetModel 来确保配置正确
+
+  if (isImageGenerationRequest) {
+    body.generationConfig = body.generationConfig || {};
+    body.generationConfig.responseModalities = ["TEXT", "IMAGE"];
+    delete body.system_instruction;
+  }
+
+  const extra = req.extra_body?.google;
+  if (extra) {
+    if (extra.safety_settings) {
+      body.safetySettings = extra.safety_settings;
+    }
+    if (extra.cached_content) {
+      body.cachedContent = extra.cached_content;
+    }
+    if (extra.thinking_config) {
+      // 这里的 thinking_config 已经包含在 transformConfig 中，但如果客户端直接传入 extra_body，则覆盖
+      body.generationConfig.thinkingConfig = extra.thinking_config;
+    }
+  }
+
+  // 确保在应用工具前，模型名称已经稳定
+  switch (true) {
+    case targetModel.endsWith(":search"):
+      targetModel = targetModel.slice(0, -7);
+      body.tools = body.tools || [];
+      body.tools.push({ "googleSearch": {} });
+      break;
+    case targetModel.endsWith(":url"):
+      targetModel = targetModel.slice(0, -4);
+      body.tools = body.tools || [];
+      body.tools.push({ "url_context": {} });
+      break;
+    case targetModel.endsWith(":execode"):
+      targetModel = targetModel.slice(0, -8);
+      body.tools = body.tools || [];
+      body.tools.push({ "code_execution": {} });
+      break;
+  }
+
+  const TASK = req.stream ? "streamGenerateContent" : "generateContent";
+
+  // --- 构建新的 Vertex AI URL，并将 API Key 作为 Query Param ---
+  let url = `${TARGET_BASE_URL}${TARGET_PREFIX}/${targetModel}:${TASK}`;
+  const newURL = new URL(url);
+  newURL.searchParams.set("key", apiKey);
+  if (req.stream) {
+    // 保留 alt=sse 以便客户端正确解析 SSE 流
+    newURL.searchParams.set("alt", "sse");
+  }
+  url = newURL.toString();
+  // --- URL 构建结束 ---
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: makeHeaders({ "Content-Type": "application/json" }), // 使用不带 key 的 headers
+    body: JSON.stringify(body),
+  });
+
+  body = response.body;
+  if (response.ok) {
+    let id = "chatcmpl-" + generateId();
+    const shared = {};
+    if (req.stream) {
+      body = response.body
+        .pipeThrough(new TextDecoderStream())
+        .pipeThrough(new TransformStream({
+          transform: parseStream,
+          flush: parseStreamFlush,
+          buffer: "",
+          shared,
+        }))
+        .pipeThrough(new TransformStream({
+          transform: toOpenAiStream,
+          flush: toOpenAiStreamFlush,
+          streamIncludeUsage: req.stream_options?.include_usage,
+          model: targetModel, // 使用最终模型 ID
+          id, last: [],
+          shared,
+        }))
+        .pipeThrough(new TextEncoderStream());
+    } else {
+      body = await response.text();
+      try {
+        body = JSON.parse(body);
+        if (!body.candidates) {
+          throw new Error("Invalid completion object");
+        }
+      } catch (err) {
+        console.error("Error parsing response:", err);
+        return new Response(body, fixCors(response));
+      }
+      body = processCompletionsResponse(body, targetModel, id); // 使用最终模型 ID
+    }
+  }
+  return new Response(body, fixCors(response));
+}
+
+
+const resolveRef = (ref, rootSchema) => {
+  if (!ref.startsWith('#/')) {
+    // We only support local refs for now
+    return null;
+  }
+  const path = ref.substring(2).split('/');
+  let current = rootSchema;
+  for (const segment of path) {
+    if (current && typeof current === 'object' && segment in current) {
+      current = current[segment];
+    } else {
+      return null;
+    }
+  }
+  return current;
+};
+
+const transformOpenApiSchemaToGemini = (schemaNode, rootSchema, visited = new Set()) => {
+  if (typeof schemaNode !== "object" || schemaNode === null || visited.has(schemaNode)) {
+    return;
+  }
+  visited.add(schemaNode);
+
+  if (schemaNode.$ref) {
+    const resolved = resolveRef(schemaNode.$ref, rootSchema);
+    if (resolved) {
+      delete schemaNode.$ref;
+      Object.assign(schemaNode, { ...JSON.parse(JSON.stringify(resolved)), ...schemaNode });
+    }
+  }
+
+  if (Array.isArray(schemaNode)) {
+    schemaNode.forEach(item => transformOpenApiSchemaToGemini(item, rootSchema, visited));
+    return;
+  }
+
+  if (schemaNode.type) {
+    const typeMap = {
+      "string": "STRING", "number": "NUMBER", "integer": "INTEGER",
+      "boolean": "BOOLEAN", "array": "ARRAY", "object": "OBJECT",
+    };
+    const primaryType = Array.isArray(schemaNode.type)
+      ? schemaNode.type.find(t => t !== "null")
+      : schemaNode.type;
+
+    if (primaryType && typeMap[primaryType.toLowerCase()]) {
+      schemaNode.type = typeMap[primaryType.toLowerCase()];
+    } else {
+      delete schemaNode.type;
+    }
+  }
+
+  if (schemaNode.type === 'ARRAY' && !schemaNode.items) {
+    schemaNode.items = { type: 'OBJECT' };
+  }
+
+  if (Array.isArray(schemaNode.anyOf)) {
+    schemaNode.anyOf.forEach(item => transformOpenApiSchemaToGemini(item, rootSchema, visited));
+
+    if (schemaNode.anyOf.every(item => item && typeof item === 'object' && item.hasOwnProperty('const'))) {
+      const enumValues = schemaNode.anyOf
+        .map(item => item.const)
+        .filter(val => val !== "" && val !== null)
+        .map(String);
+      if (enumValues.length > 0) {
+        schemaNode.type = 'STRING';
+        schemaNode.enum = enumValues;
+      }
+    } else if (!schemaNode.type) {
+      const firstValidItem = schemaNode.anyOf.find(item => item && (item.type || item.enum));
+      if (firstValidItem) {
+        Object.assign(schemaNode, firstValidItem);
+      }
+    }
+    delete schemaNode.anyOf;
+  }
+
+  const unsupportedKeys = [
+    'title', '$schema', '$ref', 'strict', 'exclusiveMaximum',
+    'exclusiveMinimum', 'additionalProperties', 'oneOf', 'allOf', 'default',
+    '$defs'
+  ];
+  unsupportedKeys.forEach(key => delete schemaNode[key]);
+
+  if (schemaNode.properties) {
+    Object.values(schemaNode.properties).forEach(prop => transformOpenApiSchemaToGemini(prop, rootSchema, visited));
+  }
+  if (schemaNode.items) {
+    transformOpenApiSchemaToGemini(schemaNode.items, rootSchema, visited);
+  }
+};
+
+const adjustSchema = (tool) => {
+  const parameters = tool.function?.parameters;
+  if (parameters) {
+    transformOpenApiSchemaToGemini(parameters, parameters);
+  }
+};
+
+const harmCategory = [
+  "HARM_CATEGORY_HATE_SPEECH",
+  "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+  "HARM_CATEGORY_DANGEROUS_CONTENT",
+  "HARM_CATEGORY_HARASSMENT",
+  "HARM_CATEGORY_CIVIC_INTEGRITY",
+];
+const safetySettings = harmCategory.map(category => ({
+  category,
+  threshold: "BLOCK_NONE",
+}));
+const fieldsMap = {
+  frequency_penalty: "frequencyPenalty",
+  max_completion_tokens: "maxOutputTokens",
+  max_tokens: "maxOutputTokens",
+  n: "candidateCount",
+  presence_penalty: "presencePenalty",
+  seed: "seed",
+  stop: "stopSequences",
+  temperature: "temperature",
+  top_k: "topK",
+  top_p: "topP",
+};
+
+const transformConfig = (req, model) => {
+  let cfg = {};
+
+  // 1. 基础参数映射
+  const fieldsMap = {
+    frequency_penalty: "frequencyPenalty",
+    max_completion_tokens: "maxOutputTokens",
+    max_tokens: "maxOutputTokens",
+    n: "candidateCount",
+    presence_penalty: "presencePenalty",
+    seed: "seed",
+    stop: "stopSequences",
+    temperature: "temperature",
+    top_k: "topK",
+    top_p: "topP",
+  };
+
+  for (let key in req) {
+    const matchedKey = fieldsMap[key];
+    if (matchedKey && req[key] !== null) {
+      cfg[matchedKey] = req[key];
+    }
+  }
+
+  // 2. Response Format (JSON Mode / JSON Schema)
+  if (req.response_format) {
+    switch (req.response_format.type) {
+      case "json_schema":
+        // 如果是 JSON Schema，必须进行转换并清理不支持的关键字
+        if (req.response_format.json_schema?.schema) {
+            // 假设 adjustSchema 和 transformOpenApiSchemaToGemini 在外部定义
+            adjustSchema(req.response_format);
+            cfg.responseSchema = req.response_format.json_schema.schema;
+            cfg.responseMimeType = "application/json";
+        }
+        break;
+      case "json_object":
+        cfg.responseMimeType = "application/json";
+        break;
+      case "text":
+        cfg.responseMimeType = "text/plain";
+        break;
+    }
+  }
+
+  // 3. Thinking / Reasoning Effort 适配
+  if (req.reasoning_effort) {
+    // 判断是否为 Gemini 3 系列 (使用 thinkingLevel)
+    const isV3 = model?.includes("gemini-3");
+
+    if (isV3) {
+      let thinkingLevel;
+      switch (req.reasoning_effort) {
+        case "low":
+          thinkingLevel = "LOW"; // 使用大写
+          break;
+        case "medium":
+          thinkingLevel = "MEDIUM"; // 使用大写
+          break;
+        case "high":
+          thinkingLevel = "HIGH"; // 使用大写
+          break;
+        default:
+          thinkingLevel = "HIGH";
+      }
+      cfg.thinkingConfig = { thinkingLevel, includeThoughts: true };
+    }
+    else {
+      // Gemini 2.5 系列 (使用 thinkingBudget)
+      let thinkingBudget;
+      const isPro = model?.includes("pro"); // 2.5-pro
+      const isLite = model?.includes("lite"); // 2.5-flash-lite
+
+      // 根据文档设定 Budget
+      switch (req.reasoning_effort) {
+        case "low":
+          // Low: 给予较低的固定 token 预算
+          thinkingBudget = isLite ? 1024 : 2048;
+          break;
+        case "medium":
+          // Medium: 启用动态思考 (Dynamic Thinking)
+          thinkingBudget = -1;
+          break;
+        case "high":
+          // High: 给予最大或接近最大的预算
+          // 2.5 Pro Max: 32768, Flash Max: 24576
+          thinkingBudget = isPro ? 32768 : 24576;
+          break;
+        default:
+          thinkingBudget = -1;
+      }
+
+      if (typeof thinkingBudget !== "undefined") {
+        cfg.thinkingConfig = { thinkingBudget, includeThoughts: true };
+      }
+    }
+  }
+
+  return cfg;
+};
+
+const parseImg = async (url) => {
+  let mimeType, data;
+  if (url.startsWith("http://") || url.startsWith("https://")) {
+    try {
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`${response.status} ${response.statusText} (${url})`);
+      }
+      mimeType = response.headers.get("content-type");
+      data = Buffer.from(await response.arrayBuffer()).toString("base64");
+    } catch (err) {
+      throw new Error("Error fetching image: " + err.toString());
+    }
+  } else {
+    const match = url.match(/^data:(?<mimeType>.*?)(;base64)?,(?<data>.*)$/);
+    if (!match) {
+      throw new HttpError("Invalid image data: " + url, 400);
+    }
+    ({ mimeType, data } = match.groups);
+  }
+  return {
+    inlineData: {
+      mimeType,
+      data,
+    },
+  };
+};
+
+const transformFnResponse = ({ content, tool_call_id }, parts) => {
+  if (!parts.calls) {
+    throw new HttpError("No function calls found in the previous message", 400);
+  }
+
+  let stringContent;
+  if (Array.isArray(content)) {
+    const textPart = content.find(part => part.type === 'text');
+    stringContent = textPart?.text;
+  } else if (typeof content === 'string') {
+    stringContent = content;
+  }
+
+  if (typeof stringContent !== 'string') {
+    throw new HttpError("Could not extract a valid string from the tool response content.", 400);
+  }
+
+  let response;
+  try {
+    // First, attempt to parse the string as JSON
+    response = JSON.parse(stringContent);
+  } catch (err) {
+    // If parsing fails, treat it as a plain string and wrap it in an object.
+    // This makes it compatible with Gemini's structured response requirement.
+    response = { result: stringContent };
+  }
+
+  // This check is still useful for cases where the parsed JSON is not an object (e.g., a number, a boolean, or an array).
+  if (typeof response !== "object" || response === null || Array.isArray(response)) {
+    response = { result: response };
+  }
+
+  if (!tool_call_id) {
+    throw new HttpError("tool_call_id not specified", 400);
+  }
+  const { i, name } = parts.calls[tool_call_id] ?? {};
+  if (!name) {
+    throw new HttpError("Unknown tool_call_id: " + tool_call_id, 400);
+  }
+  if (parts[i]) {
+    throw new HttpError("Duplicated tool_call_id: " + tool_call_id, 400);
+  }
+  parts[i] = {
+    functionResponse: {
+      name,
+      response,
+    }
+  };
+};
+
+const transformFnCalls = ({ tool_calls }) => {
+  const calls = {};
+  const parts = tool_calls.map(({ function: { arguments: argstr, name }, id, type }, i) => {
+    if (type !== "function") {
+      throw new HttpError(`Unsupported tool_call type: "${type}"`, 400);
+    }
+    let args;
+    try {
+      args = JSON.parse(argstr);
+    } catch (err) {
+      console.error("Error parsing function arguments:", err);
+      throw new HttpError("Invalid function arguments: " + argstr, 400);
+    }
+    calls[id] = { i, name };
+    return {
+      functionCall: {
+        name,
+        args,
+      }
+    };
+  });
+  parts.calls = calls;
+  return parts;
+};
+
+const transformMsg = async ({ content }) => {
+  const parts = [];
+  if (!Array.isArray(content)) {
+    if (typeof content === 'string') {
+      parts.push(...parseAssistantContent(content));
+    }
+    return parts;
+  }
+
+  for (const item of content) {
+    switch (item.type) {
+      case "input_text":
+      case "text":
+        if (item.text) {
+          parts.push(...parseAssistantContent(item.text));
+        }
+        break;
+      case "image_url":
+        const imageUrlObject = Array.isArray(item.image_url) ? item.image_url[0] : item.image_url;
+        if (imageUrlObject && imageUrlObject.url) {
+          parts.push(await parseImg(imageUrlObject.url));
+        }
+        break;
+      case "input_file": {
+        let fileDataUri = item.file_data;
+        if (!fileDataUri.startsWith("data:")) {
+          fileDataUri = `data:application/pdf;base64,${item.file_data}`;
+        }
+        const match = fileDataUri.match(/^data:(?<mimeType>.*?)(;base64)?,(?<data>.*)$/);
+        if (!match) {
+          throw new HttpError(`Invalid file_data format.`, 400);
+        }
+        const { mimeType, data } = match.groups;
+        parts.push({ inlineData: { mimeType, data } });
+        break;
+      }
+      case "file": {
+        let fileDataUri = item.file.file_data;
+        if (!fileDataUri.startsWith("data:")) {
+          fileDataUri = `data:application/pdf;base64,${item.file_data}`;
+        }
+        const match = fileDataUri.match(/^data:(?<mimeType>.*?)(;base64)?,(?<data>.*)$/);
+        if (!match) {
+          throw new HttpError(`Invalid file_data format.`, 400);
+        }
+        const { mimeType, data } = match.groups;
+        parts.push({ inlineData: { mimeType, data } });
+        break;
+      }
+      case "input_audio":
+        parts.push({
+          inlineData: {
+            mimeType: "audio/" + item.input_audio.format,
+            data: item.input_audio.data,
+          }
+        });
+        break;
+      default:
+        throw new HttpError(`Unknown "content" item type: "${item.type}"`, 400);
+    }
+  }
+  if (content.every(item => item.type === "image_url")) {
+    parts.push({ text: "" });
+  }
+  return parts;
+};
+
+function parseAssistantContent(content) {
+  const parts = [];
+  const imageMarkdownRegex = /!\[gemini-image-generation\]\(data:(image\/\w+);base64,([\w+/=-]+)\)/g;
+
+  if (typeof content !== 'string') {
+    return parts;
+  }
+
+  let lastIndex = 0;
+  let match;
+
+  while ((match = imageMarkdownRegex.exec(content)) !== null) {
+    if (match.index > lastIndex) {
+      parts.push({ text: content.substring(lastIndex, match.index) });
+    }
+
+    const mimeType = match[1];
+    const data = match[2];
+    parts.push({
+      inlineData: {
+        mimeType,
+        data,
+      },
+    });
+
+    lastIndex = match.index + match[0].length;
+  }
+
+  if (lastIndex < content.length) {
+    parts.push({ text: content.substring(lastIndex) });
+  }
+
+  if (parts.length === 0 && content) {
+    parts.push({ text: content });
+  }
+
+  return parts;
+}
+
+const transformMessages = async (messages) => {
+  if (!messages) { return []; }
+  const contents = [];
+  let system_instruction;
+
+  // 新增：用于存储上一个 assistant 消息中的 thought_signature
+  let last_model_signature = null;
+
+  for (const item of messages) {
+    switch (item.role) {
+      case "system":
+        system_instruction = { parts: await transformMsg(item) };
+        continue;
+      case "tool":
+        let { role: r, parts: p } = contents[contents.length - 1] ?? {};
+        if (r !== "function") {
+          const calls = p?.calls;
+          p = []; p.calls = calls;
+          contents.push({ role: "function", parts: p });
+        }
+
+        transformFnResponse(item, p);
+
+        // --- 核心修改：将暂存的 thought_signature 注入到 functionResponse 所在的 content block ---
+        if (last_model_signature) {
+             p.push({ thoughtSignature: last_model_signature });
+             console.log(`[ThoughtSignature] Injecting signature into function response turn.`);
+             last_model_signature = null; // 用完后清空
+        }
+        // --- 结束核心修改 ---
+
+        continue;
+      case "assistant":
+        item.role = "model";
+        const modelParts = item.tool_calls ? transformFnCalls(item) : await transformMsg(item);
+
+        // 如果有签名，捕获签名但**不立即注入**到 parts 中，而是作为独立 part 注入。
+        // 同时保存到 last_model_signature，以供下一个 role: tool 消息使用。
+        if (item.thought_signature) {
+             modelParts.push({ thoughtSignature: item.thought_signature });
+             console.log(`[ThoughtSignature] Injecting signature for model turn.`);
+
+             // 如果这是一个函数调用（即 modelParts 包含 functionCall），我们仍需为下一个 tool 消息保留它
+             if (item.tool_calls) {
+                last_model_signature = item.thought_signature;
+             }
+        }
+
+        contents.push({
+          role: item.role,
+          parts: modelParts,
+        });
+        continue;
+      case "user":
+        contents.push({
+          role: item.role,
+          parts: item.tool_calls ? transformFnCalls(item) : await transformMsg(item)
+        });
+        // 遇到新的 user 消息，重置签名
+        last_model_signature = null;
+        break;
+      default:
+        throw new HttpError(`Unknown message role: "${item.role}"`, 400);
+    }
+  }
+  if (system_instruction) {
+    if (!contents[0]?.parts.some(part => part.text)) {
+      contents.unshift({ role: "user", parts: [{ text: " " }] });
+    }
+  }
+  return { system_instruction, contents };
+};
+
+const reverseTransformValue = (value) => {
+  if (typeof value !== 'string') {
+    return value; // 如果不是字符串，直接返回
+  }
+  // 检查布尔值
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  // 检查 null
+  if (value === 'null') return null;
+  // 检查数字 (整数或浮点数)
+  if (value.trim() !== '' && !isNaN(Number(value)) && Number(value).toString() === value) {
+    return Number(value);
+  }
+  return value; // 默认返回原始字符串
+};
+
+const reverseTransformArgs = (args) => {
+  if (typeof args !== 'object' || args === null) {
+    return args;
+  }
+
+  if (Array.isArray(args)) {
+    return args.map(item => reverseTransformArgs(item)); // 递归处理数组
+  }
+
+  const newArgs = {};
+  for (const key in args) {
+    if (Object.prototype.hasOwnProperty.call(args, key)) {
+      const value = args[key];
+      if (typeof value === 'object') {
+        newArgs[key] = reverseTransformArgs(value); // 递归处理嵌套对象
+      } else {
+        newArgs[key] = reverseTransformValue(value);
+      }
+    }
+  }
+  return newArgs;
+};
+
+const transformTools = (req) => {
+  let tools, toolConfig; // 使用 camelCase 变量名以保持一致
+
+  if (req.tools) {
+    const funcs = req.tools.filter(tool => tool.type === "function");
+
+    // 对每个函数声明应用 schema 转换
+    funcs.forEach(adjustSchema);
+
+    // 使用正确的 Gemini 结构和 camelCase 键名: `functionDeclarations`
+    tools = [{
+      functionDeclarations: funcs.map(schema => schema.function)
+    }];
+  }
+
+  if (req.tool_choice) {
+    let mode = "AUTO"; // 默认模式
+    let allowedFunctionNames;
+
+    if (typeof req.tool_choice === "string") {
+      switch (req.tool_choice) {
+        case "auto":
+          mode = "AUTO";
+          break;
+        case "required":
+          // OpenAI的 "required" 意味着模型必须调用一个工具，这最接近Gemini的 "ANY"
+          mode = "ANY";
+          break;
+        case "none":
+          mode = "NONE";
+          break;
+      }
+    } else if (typeof req.tool_choice === "object" && req.tool_choice.type === "function") {
+      // 强制调用特定函数
+      mode = "ANY";
+      allowedFunctionNames = [req.tool_choice.function.name];
+    }
+
+    // 使用正确的 camelCase 键名: `functionCallingConfig`, `allowedFunctionNames`
+    toolConfig = {
+      functionCallingConfig: {
+        mode,
+        // 仅当存在时才添加 allowedFunctionNames
+        ...(allowedFunctionNames && { allowedFunctionNames })
+      }
+    };
+  }
+
+  // 返回转换后的对象，注意变量名也是 camelCase
+  return { tools, tool_config: toolConfig };
+};
+
+
+const transformRequest = async (req, model) => ({
+  ...await transformMessages(req.messages),
+  safetySettings,
+  generationConfig: transformConfig(req, model),
+  ...transformTools(req),
+});
+
+const generateId = () => {
+  const characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  const randomChar = () => characters[Math.floor(Math.random() * characters.length)];
+  return Array.from({ length: 29 }, randomChar).join("");
+};
+
+const reasonsMap = {
+  "STOP": "stop",
+  "MAX_TOKENS": "length",
+  "SAFETY": "content_filter",
+  "RECITATION": "content_filter",
+};
+
+const transformCandidates = (key, cand) => {
+  const message = { role: "assistant" };
+  const contentParts = [];
+  const reasoningParts = [];
+  let thoughtSignature = null;
+
+  for (const part of cand.content?.parts ?? []) {
+    if (part.functionCall) {
+      const fc = part.functionCall;
+      message.tool_calls = message.tool_calls ?? [];
+      message.tool_calls.push({
+        id: fc.id ?? "call_" + generateId(),
+        type: "function",
+        function: {
+          name: fc.name,
+          arguments: JSON.stringify(reverseTransformArgs(fc.args)),
+        }
+      });
+    } else if (part.thought === true && part.text) {
+      reasoningParts.push(part.text);
+    } else if (part.text) {
+      contentParts.push(part.text);
+    } else if (part.inlineData) {
+      const { mimeType, data } = part.inlineData;
+      const markdownImage = `![gemini-image-generation](data:${mimeType};base64,${data})`;
+      contentParts.push(markdownImage);
+    } else if (part.thoughtSignature) {
+      thoughtSignature = part.thoughtSignature;
+    }
+  }
+
+  const reasoningText = reasoningParts.join("\n\n");
+  if (reasoningText) {
+    message.reasoning_content = reasoningText;
+  }
+
+  message.content = contentParts.length > 0 ? contentParts.join("\n\n") : null;
+
+  const chunks = cand.groundingMetadata?.groundingChunks;
+  if (Array.isArray(chunks) && chunks.length > 0) {
+    const sources = chunks
+      .filter(chunk => chunk.web?.uri && chunk.web?.title)
+      .map(chunk => `> [${chunk.web.title}](${chunk.web.uri})`);
+
+    if (sources.length > 0) {
+      const sourcesMarkdown = `\n\n---\n${sources.join('\n')}`;
+      if (message.content) {
+        message.content += sourcesMarkdown;
+      } else {
+        message.content = sourcesMarkdown.trim();
+      }
+    }
+  }
+
+  if (cand.groundingMetadata) {
+    message.grounding_metadata = cand.groundingMetadata;
+  }
+  if (cand.url_context_metadata) {
+    message.url_context_metadata = cand.url_context_metadata;
+  }
+  if (thoughtSignature) {
+    message.thought_signature = thoughtSignature;
+  }
+
+  return {
+    index: cand.index || 0,
+    [key]: message,
+    logprobs: null,
+    finish_reason: message.tool_calls ? "tool_calls" : reasonsMap[cand.finishReason] || cand.finishReason,
+  };
+};
+
+const transformCandidatesMessage = (cand) => transformCandidates("message", cand);
+const transformCandidatesDelta = (cand) => transformCandidates("delta", cand);
+
+const notEmpty = (el) => Object.values(el).some(Boolean) ? el : undefined;
+
+const sum = (...numbers) => numbers.reduce((total, num) => total + (num ?? 0), 0);
+const transformUsage = (data) => ({
+  completion_tokens: sum(data.candidatesTokenCount, data.toolUsePromptTokenCount, data.thoughtsTokenCount),
+  prompt_tokens: data.promptTokenCount,
+  total_tokens: data.totalTokenCount,
+  completion_tokens_details: notEmpty({
+    audio_tokens: data.candidatesTokensDetails
+      ?.find(el => el.modality === "AUDIO")
+      ?.tokenCount,
+    reasoning_tokens: data.thoughtsTokenCount,
+  }),
+  prompt_tokens_details: notEmpty({
+    audio_tokens: data.promptTokensDetails
+      ?.find(el => el.modality === "AUDIO")
+      ?.tokenCount,
+    cached_tokens: data.cacheTokensDetails
+      ?.reduce((acc, el) => acc + el.tokenCount, 0),
+  }),
+});
+
+const checkPromptBlock = (choices, promptFeedback, key) => {
+  if (choices.length) { return; }
+  if (promptFeedback?.blockReason) {
+    console.log("Prompt block reason:", promptFeedback.blockReason);
+    if (promptFeedback.blockReason === "SAFETY") {
+      promptFeedback.safetyRatings
+        .filter(r => r.blocked)
+        .forEach(r => console.log(r));
+    }
+    choices.push({
+      index: 0,
+      [key]: null,
+      finish_reason: "content_filter",
+    });
+  }
+  return true;
+};
+
+const processCompletionsResponse = (data, model, id) => {
+  const obj = {
+    id,
+    choices: data.candidates.map(cand => transformCandidatesMessage(cand)),
+    created: Math.floor(Date.now() / 1000),
+    model: data.modelVersion ?? model,
+    object: "chat.completion",
+    usage: data.usageMetadata && transformUsage(data.usageMetadata),
+  };
+  if (obj.choices.length === 0) {
+    checkPromptBlock(obj.choices, data.promptFeedback, "message");
+  }
+  return JSON.stringify(obj, null, 2);
+};
+
+const responseLineRE = /^data: (.*)(?:\n\n|\r\r|\r\n\r\n)/;
+function parseStream(chunk, controller) {
+  this.buffer += chunk;
+  do {
+    const match = this.buffer.match(responseLineRE);
+    if (!match) { break; }
+    controller.enqueue(match[1]);
+    this.buffer = this.buffer.substring(match[0].length);
+  } while (true);
+}
+function parseStreamFlush(controller) {
+  if (this.buffer) {
+    console.error("Invalid data:", this.buffer);
+    controller.enqueue(this.buffer);
+    this.shared.is_buffers_rest = true;
+  }
+}
+
+const delimiter = "\n\n";
+const sseline = (obj) => {
+  obj.created = Math.floor(Date.now() / 1000);
+  return "data: " + JSON.stringify(obj) + delimiter;
+};
+function toOpenAiStream(line, controller) {
+  let data;
+  try {
+    data = JSON.parse(line);
+    if (!data.candidates) {
+      throw new Error("Invalid completion chunk object");
+    }
+  } catch (err) {
+    console.error("Error parsing response:", err);
+    if (!this.shared.is_buffers_rest) { line = + delimiter; }
+    controller.enqueue(line);
+    return;
+  }
+  const obj = {
+    id: this.id,
+    choices: data.candidates.map(cand => transformCandidatesDelta(cand)),
+    model: data.modelVersion ?? this.model,
+    object: "chat.completion.chunk",
+    usage: data.usageMetadata && this.streamIncludeUsage ? null : undefined,
+  };
+  if (checkPromptBlock(obj.choices, data.promptFeedback, "delta")) {
+    controller.enqueue(sseline(obj));
+    return;
+  }
+  console.assert(data.candidates.length === 1, "Unexpected candidates count: %d", data.candidates.length);
+  const cand = obj.choices[0];
+  cand.index = cand.index || 0;
+  const finish_reason = cand.finish_reason;
+  cand.finish_reason = null;
+  if (!this.last[cand.index]) {
+    controller.enqueue(sseline({
+      ...obj,
+      choices: [{ ...cand, tool_calls: undefined, delta: { role: "assistant", content: "" } }],
+    }));
+  }
+  delete cand.delta.role;
+
+  if (cand.delta.content === null) {
+    delete cand.delta.content;
+  }
+
+  const hasContent = "content" in cand.delta;
+  const hasReasoning = "reasoning_content" in cand.delta;
+  const hasToolCalls = "tool_calls" in cand.delta;
+  // 因为元数据也被添加到了 delta 对象中，所以也要检查它们
+  const hasGrounding = "grounding_metadata" in cand.delta;
+  const hasUrlContext = "url_context_metadata" in cand.delta;
+
+  if (hasContent || hasReasoning || hasToolCalls || hasGrounding || hasUrlContext) {
+    controller.enqueue(sseline(obj));
+  }
+
+  cand.finish_reason = finish_reason;
+  if (data.usageMetadata && this.streamIncludeUsage) {
+    obj.usage = transformUsage(data.usageMetadata);
+  }
+  cand.delta = {};
+  this.last[cand.index] = obj;
+}
+function toOpenAiStreamFlush(controller) {
+  if (this.last.length > 0) {
+    for (const obj of this.last) {
+      controller.enqueue(sseline(obj));
+    }
+    controller.enqueue("data: [DONE]" + delimiter);
+  }
+}
