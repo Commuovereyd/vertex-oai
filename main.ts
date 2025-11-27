@@ -4,12 +4,18 @@ import { Buffer } from "node:buffer";
 const TARGET_BASE_URL = "https://aiplatform.googleapis.com";
 const TARGET_PREFIX = "/v1/publishers/google/models";
 
+// 定义图片生成模型列表，用于特殊处理配置
+const IMAGE_MODELS = [
+  "gemini-3-pro-image-preview",
+  "gemini-2.5-flash-image",
+  "gemini-2.0-flash-exp-image"
+];
+
 export default {
   async fetch(request) {
     if (request.method === "OPTIONS") {
       return handleOPTIONS();
     }
-    // 确保 API Key 在请求头 (Authorization) 中获取
     const auth = request.headers.get("Authorization");
     const apiKey = auth?.split(" ")[1];
 
@@ -375,13 +381,16 @@ async function handleCompletions(req, apiKey) {
     targetModel = "gemini-3-pro-preview";
   }
 
-  const isImageGenerationRequest = targetModel.includes("-image");
-
   let body = await transformRequest(req, targetModel);
 
-  if (isImageGenerationRequest) {
+  // 特殊处理图片生成模型的配置
+  if (IMAGE_MODELS.includes(targetModel)) {
     body.generationConfig = body.generationConfig || {};
-    body.generationConfig.responseModalities = ["TEXT", "IMAGE"];
+    // 图片模型必须包含 IMAGE 模态
+    if (!body.generationConfig.responseModalities) {
+        body.generationConfig.responseModalities = ["TEXT", "IMAGE"];
+    }
+    // 图片模型通常没有 system instruction
     delete body.system_instruction;
   }
 
@@ -395,6 +404,10 @@ async function handleCompletions(req, apiKey) {
     }
     if (extra.thinking_config) {
       body.generationConfig.thinkingConfig = extra.thinking_config;
+    }
+    // 支持从 extra_body 传入 image_config (OpenAI API 没有原生 image_config 参数)
+    if (extra.image_config) {
+      body.generationConfig.imageConfig = extra.image_config;
     }
   }
 
@@ -745,12 +758,8 @@ const transformFnResponse = ({ content, tool_call_id }, parts) => {
   };
 };
 
-// 修复: 接收完整 message 对象，以便正确提取 thought_signature 并注入到 Gemini 3 Pro 要求的第一个 functionCall 中
 const transformFnCalls = (message) => {
   const { tool_calls } = message;
-  
-  // 按照文档：OpenAI Compatibility 模式下，thought_signature 可能会被客户端回传在 extra_content.google.thought_signature
-  // 或者为了兼容旧习惯，也检查 message 根级别的 thought_signature
   const signature = message.thought_signature || 
                     message.extra_content?.google?.thought_signature ||
                     tool_calls?.[0]?.extra_content?.google?.thought_signature;
@@ -776,7 +785,6 @@ const transformFnCalls = (message) => {
       }
     };
 
-    // 关键修复：Gemini 3 Pro 要求如果是函数调用，必须将 thoughtSignature 附着在第一个 functionCall 上
     if (i === 0 && signature) {
         part.thoughtSignature = signature;
     }
@@ -853,7 +861,9 @@ const transformMsg = async ({ content }) => {
   return parts;
 };
 
-function parseAssistantContent(content) {
+// 辅助函数：从文本中提取 Base64 图片 Markdown 并转换为 parts
+// 同时支持返回提取后的纯文本
+function parseAssistantContent(content, onlyExtractImages = false) {
   const parts = [];
   const imageMarkdownRegex = /!\[gemini-image-generation\]\(data:(image\/\w+);base64,([\w+/=-]+)\)/g;
 
@@ -869,14 +879,17 @@ function parseAssistantContent(content) {
       parts.push({ text: content.substring(lastIndex, match.index) });
     }
 
-    const mimeType = match[1];
-    const data = match[2];
-    parts.push({
-      inlineData: {
-        mimeType,
-        data,
-      },
-    });
+    // 只有在非 V3 图片模型时，我们才真正解析图片数据放入 context
+    if (!onlyExtractImages) {
+        const mimeType = match[1];
+        const data = match[2];
+        parts.push({
+          inlineData: {
+            mimeType,
+            data,
+          },
+        });
+    }
 
     lastIndex = match.index + match[0].length;
   }
@@ -892,10 +905,13 @@ function parseAssistantContent(content) {
   return parts;
 }
 
-const transformMessages = async (messages) => {
+const transformMessages = async (messages, model) => {
   if (!messages) { return []; }
   const contents = [];
   let system_instruction;
+
+  // 判断是否为 V3+ 图片模型 (Gemini 3 Pro Image)
+  const isV3ImageModel = model && model.includes("gemini-3") && model.includes("image");
 
   for (const item of messages) {
     switch (item.role) {
@@ -903,8 +919,6 @@ const transformMessages = async (messages) => {
         system_instruction = { parts: await transformMsg(item) };
         continue;
       case "tool":
-        // 角色为 tool 时，根据文档，不应该在这里注入 signature。
-        // signature 属于上一条 model 消息（assistant 角色）。
         let { role: r, parts: p } = contents[contents.length - 1] ?? {};
         if (r !== "function") {
           const calls = p?.calls;
@@ -916,19 +930,35 @@ const transformMessages = async (messages) => {
       case "assistant":
         item.role = "model";
         let modelParts;
+        
         if (item.tool_calls) {
-            // 如果有工具调用，调用修复后的 transformFnCalls，它会处理 thoughtSignature 的注入
+            // 工具调用，处理签名逻辑 (V3 Pro)
             modelParts = transformFnCalls(item);
         } else {
-            // 纯文本回复
-            modelParts = await transformMsg(item);
-            // 如果存在 thought_signature 且没有 tool_calls，根据文档，推荐附在最后一部分
+            // 文本/图片生成回复
             const signature = item.thought_signature || item.extra_content?.google?.thought_signature;
-            if (signature && modelParts.length > 0) {
-                // Vertex AI 允许在文本 part 中包含 thoughtSignature，或者单独一个 part
-                // 简单起见，如果最后一部分是 text，附着上去（如果 API 支持），或者作为新 part
-                // 目前为了安全，我们假设它作为单独属性存在于 part 对象中
-                modelParts[modelParts.length - 1].thoughtSignature = signature;
+            
+            if (isV3ImageModel && signature) {
+               // V3 Image 模型且存在签名：
+               // 1. 解析文本，移除 Markdown 图片链接 (不做 inlineData 转换，因为签名包含上下文)
+               // 2. 注入 thoughtSignature
+               
+               let rawContent = typeof item.content === 'string' ? item.content : "";
+               if (Array.isArray(item.content)) {
+                   rawContent = item.content.map(c => c.text || "").join("");
+               }
+               
+               // 使用 parseAssistantContent 但设置 onlyExtractImages=true 来仅仅剥离图片md，不生成inlineData
+               const textParts = parseAssistantContent(rawContent, true); // true = skip inlineData creation
+               
+               modelParts = textParts;
+               // 注入签名作为单独的 part
+               modelParts.push({ thoughtSignature: signature });
+
+            } else {
+               // V2.5 或 V3 无签名（不太可能）或普通对话：
+               // 正常解析 markdown 图片为 inlineData
+               modelParts = await transformMsg(item);
             }
         }
 
@@ -1038,7 +1068,7 @@ const transformTools = (req) => {
 
 
 const transformRequest = async (req, model) => ({
-  ...await transformMessages(req.messages),
+  ...await transformMessages(req.messages, model),
   safetySettings,
   generationConfig: transformConfig(req, model),
   ...transformTools(req),
@@ -1075,7 +1105,6 @@ const transformCandidates = (key, cand) => {
           arguments: JSON.stringify(reverseTransformArgs(fc.args)),
         }
       });
-      // 检查 functionCall 部件上是否直接附带了 thoughtSignature (Gemini 3 Pro)
       if (part.thoughtSignature) {
           thoughtSignature = part.thoughtSignature;
       }
@@ -1085,10 +1114,10 @@ const transformCandidates = (key, cand) => {
       contentParts.push(part.text);
     } else if (part.inlineData) {
       const { mimeType, data } = part.inlineData;
+      // 无论 V2.5 还是 V3，返回给客户端(OpenAI format)时都转为 Markdown 图片以便查看
       const markdownImage = `![gemini-image-generation](data:${mimeType};base64,${data})`;
       contentParts.push(markdownImage);
     } else if (part.thoughtSignature) {
-      // 文本部分的 thoughtSignature
       thoughtSignature = part.thoughtSignature;
     }
   }
@@ -1123,21 +1152,19 @@ const transformCandidates = (key, cand) => {
     message.url_context_metadata = cand.url_context_metadata;
   }
 
-  // 关键修复：根据文档的 "OpenAI Compatibility" 示例，将 thoughtSignature 放入正确位置
+  // 处理 thoughtSignature
   if (thoughtSignature) {
     if (message.tool_calls && message.tool_calls.length > 0) {
-        // 如果有工具调用，签名必须附在第一个工具调用中
         const firstToolCall = message.tool_calls[0];
         if (!firstToolCall.extra_content) firstToolCall.extra_content = {};
         if (!firstToolCall.extra_content.google) firstToolCall.extra_content.google = {};
         firstToolCall.extra_content.google.thought_signature = thoughtSignature;
     } else {
-        // 如果是纯文本回复，通常放在 extra_content 或者根节点（取决于客户端如何处理）
-        // 文档未明确指定非工具调用的 OpenAI 映射，但保持一致性建议放在 extra_content
+        // 对于纯图片生成或文本生成，将签名放入 extra_content
         if (!message.extra_content) message.extra_content = {};
         if (!message.extra_content.google) message.extra_content.google = {};
         message.extra_content.google.thought_signature = thoughtSignature;
-        // 为了兼容性，也可以在根节点保留一份
+        // 兼容性保留
         message.thought_signature = thoughtSignature;
     }
   }
