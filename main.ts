@@ -794,9 +794,6 @@ const transformFnCalls = (message) => {
 };
 
 // 辅助函数：从文本中提取 Base64 图片 Markdown 并转换为 parts
-// 参数 convertImages: 
-//   true -> 将 Markdown 图片解析为 inlineData (用于 V2.5 或无签名情况)
-//   false -> 移除 Markdown 图片链接，只保留文本 (用于 V3 有签名情况)
 function parseAssistantContent(content, stripImages = false) {
   const parts = [];
   const imageMarkdownRegex = /!\[gemini-image-generation\]\(data:(image\/\w+);base64,([\w+/=-]+)\)/g;
@@ -813,7 +810,6 @@ function parseAssistantContent(content, stripImages = false) {
       parts.push({ text: content.substring(lastIndex, match.index) });
     }
 
-    // 如果不剥离图片，则转换数据；如果剥离图片，则跳过
     if (!stripImages) {
         const mimeType = match[1];
         const data = match[2];
@@ -843,7 +839,6 @@ const transformMsg = async ({ content }) => {
   const parts = [];
   if (!Array.isArray(content)) {
     if (typeof content === 'string') {
-      // 默认解析图片（用于 User 消息中的图片 Markdown 兼容，虽然通常 user 图片是 image_url）
       parts.push(...parseAssistantContent(content, false));
     }
     return parts;
@@ -913,7 +908,6 @@ const transformMessages = async (messages, model) => {
   let system_instruction;
 
   // 判断是否为 V3+ 图片模型 (Gemini 3 Pro Image)
-  // 仅当模型名为 gemini-3-pro-image-preview 或类似变体时生效
   const isV3ImageModel = model && model.includes("gemini-3") && model.includes("image");
 
   for (const item of messages) {
@@ -932,31 +926,38 @@ const transformMessages = async (messages, model) => {
         continue;
       case "assistant":
         item.role = "model";
-        let modelParts;
+        let modelParts = [];
         
+        // 【关键修复】显式处理 OpenAI 格式的 reasoning_content
+        // 如果 input JSON 中包含 reasoning_content，将其视为第一部分文本
+        if (item.reasoning_content) {
+            modelParts.push({ text: item.reasoning_content });
+        }
+
         if (item.tool_calls) {
-            modelParts = transformFnCalls(item);
+            const toolParts = transformFnCalls(item);
+            modelParts.push(...toolParts);
         } else {
-            // 检查是否有客户端回传的签名
             const signature = item.thought_signature || item.extra_content?.google?.thought_signature;
             
             if (isV3ImageModel && signature) {
-               // 【V3 逻辑】：有签名时，只保留文本，移除图片数据，注入签名
+               // 【V3 逻辑】
                let rawContent = typeof item.content === 'string' ? item.content : "";
                if (Array.isArray(item.content)) {
-                   // 简单拼接 text 部分，因为 parseAssistantContent 会处理字符串中的 markdown 图片
                    rawContent = item.content.map(c => c.text || "").join("");
                }
                
-               // stripImages = true: 移除 markdown 图片链接，不生成 inlineData
+               // 移除 content 中的 markdown 图片链接，仅保留文本
                const textParts = parseAssistantContent(rawContent, true); 
                
-               modelParts = textParts;
+               modelParts.push(...textParts);
+               // 最后附加签名
                modelParts.push({ thoughtSignature: signature });
 
             } else {
-               // 【V2.5 逻辑】或普通对话：将 Markdown 图片转回 inlineData
-               modelParts = await transformMsg(item);
+               // 【V2.5 逻辑】
+               const contentParts = await transformMsg(item);
+               modelParts.push(...contentParts);
             }
         }
 
@@ -1112,10 +1113,8 @@ const transformCandidates = (key, cand) => {
       contentParts.push(part.text);
     } else if (part.inlineData) {
       const { mimeType, data } = part.inlineData;
-      // 始终转为 Markdown 供客户端显示
       const markdownImage = `![gemini-image-generation](data:${mimeType};base64,${data})`;
       contentParts.push(markdownImage);
-      // 【关键修复】如果 inlineData 节点带有签名，也提取出来
       if (part.thoughtSignature) {
           thoughtSignature = part.thoughtSignature;
       }
@@ -1154,7 +1153,6 @@ const transformCandidates = (key, cand) => {
     message.url_context_metadata = cand.url_context_metadata;
   }
 
-  // 处理 thoughtSignature 到 OpenAI 格式
   if (thoughtSignature) {
     if (message.tool_calls && message.tool_calls.length > 0) {
         const firstToolCall = message.tool_calls[0];
@@ -1165,7 +1163,6 @@ const transformCandidates = (key, cand) => {
         if (!message.extra_content) message.extra_content = {};
         if (!message.extra_content.google) message.extra_content.google = {};
         message.extra_content.google.thought_signature = thoughtSignature;
-        // 兼容性
         message.thought_signature = thoughtSignature;
     }
   }
@@ -1305,7 +1302,6 @@ function toOpenAiStream(line, controller) {
   const hasToolCalls = "tool_calls" in cand.delta;
   const hasGrounding = "grounding_metadata" in cand.delta;
   const hasUrlContext = "url_context_metadata" in cand.delta;
-  // 【关键修复】流式输出时也要检查签名
   const hasSignature = "thought_signature" in cand.delta || 
                        (cand.delta.extra_content?.google?.thought_signature);
 
